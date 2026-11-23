@@ -211,13 +211,24 @@
                 <label class="field field-full">DELIVERY NOTES <span class="optional">OPTIONAL</span><input name="notes" placeholder="Gate code, landmark, or anything helpful" /></label>
               </div>
             </fieldset>
+            <fieldset class="logistics-fieldset">
+              <legend>03 / LOGISTICS PARTNER</legend>
+              <div class="logistics-options">
+                <label class="payment-choice"><input type="radio" name="logistics" value="jnt" checked /><span class="radio-dot"></span><span><strong>J&amp;T EXPRESS</strong><small>Third-party courier</small></span></label>
+                <label class="payment-choice"><input type="radio" name="logistics" value="lbc" /><span class="radio-dot"></span><span><strong>LBC EXPRESS</strong><small>Third-party courier</small></span></label>
+                <label class="payment-choice"><input type="radio" name="logistics" value="flash" /><span class="radio-dot"></span><span><strong>FLASH EXPRESS</strong><small>Third-party courier</small></span></label>
+                <label class="payment-choice"><input type="radio" name="logistics" value="ninjavan" /><span class="radio-dot"></span><span><strong>NINJA VAN</strong><small>Third-party courier</small></span></label>
+                <label class="payment-choice"><input type="radio" name="logistics" value="lalamove" /><span class="radio-dot"></span><span><strong>LALAMOVE</strong><small>Third-party courier</small></span></label>
+              </div>
+            </fieldset>
             <fieldset>
-              <legend>03 / PAYMENT</legend>
+              <legend>04 / PAYMENT</legend>
               <label class="payment-choice"><input type="radio" name="payment" value="cash_on_delivery" checked /><span class="radio-dot"></span><span><strong>CASH ON DELIVERY</strong><small>Pay your courier upon delivery</small></span><b>₱</b></label>
             </fieldset>
             <div class="checkout-error" id="checkout-message" role="alert" hidden></div>
             <button class="solid-button place-order" type="submit">PLACE ORDER <span>↗</span></button>
             <p class="privacy-note">Your order and delivery details are saved securely for fulfillment. Payment is due at delivery.</p>
+            <p class="privacy-note">Cash on delivery: cancelling or refusing your parcel once it is out for delivery will suspend your account for 3 months.</p>
           </form>
         </div>
         <aside class="checkout-summary">
