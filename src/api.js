@@ -1,5 +1,6 @@
 const crypto = require("node:crypto");
 const bcrypt = require("bcryptjs");
+const nodemailer = require("nodemailer");
 const {
   json, fail, issueCsrf, validateCsrf, readJson, readBuffer, text, email, password, safeUser,
   currentUser, startSession, endSession, activity, requireUser, randomToken, digest, clearCookie, SESSION_COOKIE, expiryDate
@@ -55,24 +56,29 @@ function htmlEscape(value) {
 }
 
 async function sendCustomerPasswordResetEmail(address, customerName, token) {
+  const gmailUser = String(process.env.GMAIL_USER || "").trim();
+  const appPassword = String(process.env.GMAIL_APP_PASSWORD || "").replace(/\s+/g, "");
+  if (!gmailUser || !appPassword) throw new Error("Gmail SMTP is not configured.");
   const appUrl = new URL(process.env.APP_URL || "https://jacoh.vercel.app");
   if (appUrl.protocol !== "https:" && appUrl.hostname !== "localhost") throw new Error("APP_URL must use HTTPS.");
   const resetUrl = appUrl.origin + "/reset-password#token=" + encodeURIComponent(token);
-  const response = await fetch("https://api.resend.com/emails", {
-    method: "POST",
-    headers: { "Authorization": "Bearer " + process.env.RESEND_API_KEY, "Content-Type": "application/json" },
-    body: JSON.stringify({
-      from: process.env.EMAIL_FROM,
-      to: [address],
+  const transporter = nodemailer.createTransport({
+    service: "gmail",
+    auth: { user: gmailUser, pass: appPassword },
+    connectionTimeout: 10000,
+    greetingTimeout: 10000,
+    socketTimeout: 10000
+  });
+  try {
+    await transporter.sendMail({
+      from: `"JACOH" <${gmailUser}>`,
+      to: address,
       subject: "Reset your JACOH customer password",
       html: "<p>Hi " + htmlEscape(customerName || "there") + ",</p><p>Use the secure link below to choose a new password for your JACOH customer account. The link expires in one hour and can only be used once.</p><p><a href=\"" + resetUrl + "\">RESET PASSWORD</a></p><p>If you did not request this, you can ignore this email.</p>",
       text: "Use this secure link to reset your JACOH customer account password. It expires in one hour and can only be used once: " + resetUrl + "\n\nIf you did not request this, you can ignore this email."
-    }),
-    signal: AbortSignal.timeout(10000)
-  });
-  if (!response.ok) {
-    await response.text().catch(() => "");
-    throw new Error("Email provider rejected the password reset message.");
+    });
+  } finally {
+    transporter.close();
   }
 }
 
@@ -452,7 +458,7 @@ async function dispatchApi(request, response, url, pool) {
   if (method === "POST" && route === "/api/auth/password-reset") {
     const body = await readJson(request);
     const address = email(body.email);
-    if (!process.env.RESEND_API_KEY || !process.env.EMAIL_FROM) return fail(response, 503, passwordResetUnavailableMessage, "email_unavailable");
+    if (!String(process.env.GMAIL_USER || "").trim() || !String(process.env.GMAIL_APP_PASSWORD || "").replace(/\s/g, "")) return fail(response, 503, passwordResetUnavailableMessage, "email_unavailable");
     let issuedReset = null;
     const connection = await pool.getConnection();
     try {

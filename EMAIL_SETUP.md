@@ -1,19 +1,19 @@
 # Customer account recovery email
 
-JACOH sends customer password reset links through Resend. The reset link expires after one hour and can only be used once.
+JACOH sends customer password reset links through Gmail SMTP. Reset links expire after one hour and can only be used once.
 
-## Configure email delivery
+## Configure Gmail SMTP
 
-1. Verify a sending domain in Resend and create an API key.
-2. Add these environment variables to the JACOH deployment (for Vercel, add them to the project settings and redeploy):
+1. Use a dedicated Gmail account for JACOH.
+2. Turn on 2-Step Verification for that Google account, then create an App Password for Mail. Google requires 2-Step Verification for App Passwords, and some managed or protected accounts do not offer them.
+3. In the JACOH Vercel project, open **Settings → Environment Variables** and add these for **Production**:
+   - `GMAIL_USER`: the complete Gmail address used to send reset messages.
+   - `GMAIL_APP_PASSWORD`: the 16-character App Password. Store it as a **Secret**.
+   - `APP_URL`: the public site origin, normally `https://jacoh.vercel.app`. This project already has this value set.
+4. Merge the pull request and redeploy so the settings and code are active.
 
-   - `RESEND_API_KEY`: the Resend API key
-   - `EMAIL_FROM`: a sender address on the verified domain, for example `JACOH <accounts@example.com>`
-   - `APP_URL`: the public site origin, for example `https://jacoh.vercel.app`
-
-The app defaults `APP_URL` to `https://jacoh.vercel.app`. Set it explicitly if the production domain changes. Keep `RESEND_API_KEY` server-side; do not add it to a `NEXT_PUBLIC_*` variable or client code.
+The sender will appear as **JACOH** using the Gmail address in `GMAIL_USER`. Do not use the regular Google account password, commit the App Password, or expose it in browser code. Google recommends OAuth 2.0 for new integrations; this setup uses an App Password for a simpler SMTP configuration. Gmail requires 2-Step Verification, and Google may block SMTP connections it considers unusual.
 
 ## Database setup
 
-Apply [database/migrations/20261127_customer_cart_password_reset.sql](database/migrations/20261127_customer_cart_password_reset.sql) to the Supabase database before deploying the app code. It creates the account cart and password reset token tables with row-level security enabled and public API access revoked.
-
+The migration was applied to the connected JACOH Supabase project. For a fresh database, apply [database/migrations/20261127_customer_cart_password_reset.sql](database/migrations/20261127_customer_cart_password_reset.sql) before deploying. It creates the account cart and password reset token tables with row-level security enabled and public API access revoked.
