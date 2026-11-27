@@ -80,38 +80,102 @@ const state = {
   catalogError: false,
   selections: Object.fromEntries(products.map((product) => [product.id, { color: product.color, size: product.sizes.length === 1 ? product.sizes[0] : "" }])),
   cart: [],
-  pendingOrderReference: savedCheckoutReference || newCheckoutReference()
+  pendingOrderReference: savedCheckoutReference || newCheckoutReference(),
+  cartSyncStatus: "syncing"
 };
 try { sessionStorage.setItem("jacoh-checkout-reference", state.pendingOrderReference); } catch { /* The in-memory key still protects this page session. */ }
 
 // BAG RULES
 // - A guest's bag lives in memory only: refreshing the page, or another visitor opening the shop, starts with an empty bag.
-// - A signed-in customer's bag is saved under their own account id, so it survives logging out and in and is never shown to anyone else.
+// - A signed-in customer's bag is stored on the server under their account, with a local copy for offline recovery.
 // - The only guest hand-off is the one-time "sign in to check out" trip (see openCheckout and handoffCart below).
 const BAG_KEY_PREFIX = "jacoh-bag:";
 const HANDOFF_KEY = "jacoh-bag-handoff";
 try { localStorage.removeItem("jacoh-bag"); } catch { /* The old shared bag from earlier versions is no longer used. */ }
 
+function cartLineKey(item) { return JSON.stringify([item.id, item.size, item.color]); }
+
 function cleanCart(list) {
-  return Array.isArray(list) ? list.filter((item) => item && typeof item.id === "string" && Number(item.quantity) > 0).map((item) => ({ id: item.id, size: item.size, color: item.color, quantity: Math.floor(Number(item.quantity)) })) : [];
+  if (!Array.isArray(list)) return [];
+  const items = new Map();
+  for (const item of list) {
+    if (!item || typeof item.id !== "string" || typeof item.size !== "string" || typeof item.color !== "string") continue;
+    const quantity = Math.min(10, Math.floor(Number(item.quantity)));
+    if (!Number.isFinite(quantity) || quantity < 1) continue;
+    const key = cartLineKey(item);
+    const existing = items.get(key);
+    if (existing) existing.quantity = Math.min(10, existing.quantity + quantity);
+    else if (items.size < 30) items.set(key, { id: item.id, size: item.size, color: item.color, quantity });
+  }
+  return Array.from(items.values());
 }
 
 function mergeCarts(base, extra) {
-  const merged = base.map((item) => ({ ...item }));
-  for (const item of extra) {
-    const match = merged.find((line) => line.id === item.id && line.size === item.size && line.color === item.color);
-    if (match) match.quantity += item.quantity; else merged.push({ ...item });
-  }
-  return merged;
+  return cleanCart([...cleanCart(base), ...cleanCart(extra)]);
 }
 
+function sameCart(left, right) {
+  return JSON.stringify(cleanCart(left)) === JSON.stringify(cleanCart(right));
+}
+
+function applyCartDelta(base, desired, current) {
+  const previous = new Map(cleanCart(base).map((item) => [cartLineKey(item), item]));
+  const wanted = new Map(cleanCart(desired).map((item) => [cartLineKey(item), item]));
+  const result = new Map(cleanCart(current).map((item) => [cartLineKey(item), { ...item }]));
+  const order = Array.from(result.keys());
+  for (const key of new Set([...previous.keys(), ...wanted.keys()])) {
+    const delta = (wanted.get(key)?.quantity || 0) - (previous.get(key)?.quantity || 0);
+    if (!delta) continue;
+    const quantity = Math.max(0, Math.min(10, (result.get(key)?.quantity || 0) + delta));
+    if (!quantity) { result.delete(key); continue; }
+    const template = result.get(key) || wanted.get(key) || previous.get(key);
+    result.set(key, { ...template, quantity });
+    if (!order.includes(key)) order.push(key);
+  }
+  return order.filter((key) => result.has(key)).map((key) => result.get(key));
+}
+
+let cartHydrating = true;
+let cartRemoteReady = false;
+let cartRemoteSnapshot = [];
+let cartSyncPromise = null;
+let cartSyncRequested = false;
+let cartRetryTimer = null;
+
 function loadAccountCart(userId) {
-  try { return cleanCart(JSON.parse(localStorage.getItem(BAG_KEY_PREFIX + userId) || "[]")); } catch { return []; }
+  try {
+    const stored = JSON.parse(localStorage.getItem(BAG_KEY_PREFIX + userId) || "[]");
+    if (Array.isArray(stored)) return { items: cleanCart(stored), synced: [] }; // Legacy browser-only cart.
+    return { items: cleanCart(stored?.items), synced: cleanCart(stored?.synced) };
+  } catch { return { items: [], synced: [] }; }
+}
+
+function writeAccountCart(userId, items, synced = cartRemoteSnapshot) {
+  try {
+    localStorage.setItem(BAG_KEY_PREFIX + userId, JSON.stringify({ items: cleanCart(items), synced: cleanCart(synced) }));
+  } catch { /* The server copy remains authoritative when browser storage is unavailable. */ }
+}
+
+function rebaseAccountCart(remote, local) {
+  const current = cleanCart(remote);
+  if (sameCart(current, local.items)) return current;
+  return applyCartDelta(local.synced, local.items, current);
+}
+
+function scheduleCartRetry(delay = 5000) {
+  if (cartRetryTimer || !isCustomer()) return;
+  cartRetryTimer = setTimeout(() => {
+    cartRetryTimer = null;
+    void syncAccountCart();
+  }, delay);
 }
 
 function persistCart() {
-  if (state.user?.accountType !== "customer") return; // guests are never saved
-  try { localStorage.setItem(BAG_KEY_PREFIX + state.user.id, JSON.stringify(state.cart)); } catch { /* Private mode: the bag simply is not saved. */ }
+  if (!isCustomer() || cartHydrating) return;
+  state.cart = cleanCart(state.cart);
+  writeAccountCart(state.user.id, state.cart, cartRemoteSnapshot);
+  if (cartRemoteReady) void syncAccountCart();
+  else scheduleCartRetry(1000);
 }
 
 // Drop pieces that no longer exist and keep each piece within the stock available now.
@@ -127,6 +191,88 @@ function pruneCart() {
   state.cart = kept;
   persistCart();
 }
+
+async function hydrateCustomerCart(handoff) {
+  cartHydrating = true;
+  try {
+    const result = await window.JacohAPI.request("/api/customer/cart");
+    const remote = cleanCart(result.items);
+    const local = loadAccountCart(state.user.id);
+    const pending = cleanCart(state.cart);
+    cartRemoteSnapshot = remote;
+    cartRemoteReady = true;
+    state.cart = mergeCarts(rebaseAccountCart(remote, local), mergeCarts(pending, handoff));
+    state.cartSyncStatus = sameCart(state.cart, remote) ? "saved" : "syncing";
+    cartHydrating = false;
+    if (state.catalogReady) pruneCart();
+    else persistCart();
+    renderCart();
+  } catch {
+    const local = loadAccountCart(state.user.id);
+    const pending = cleanCart(state.cart);
+    state.cart = mergeCarts(local.items, mergeCarts(pending, handoff));
+    cartRemoteReady = false;
+    state.cartSyncStatus = "offline";
+    cartHydrating = false;
+    writeAccountCart(state.user.id, state.cart, local.synced);
+    renderCart();
+    scheduleCartRetry();
+  }
+}
+
+async function syncAccountCart() {
+  if (!isCustomer() || cartHydrating) return;
+  if (cartRetryTimer) { clearTimeout(cartRetryTimer); cartRetryTimer = null; }
+  if (cartSyncPromise) { cartSyncRequested = true; return cartSyncPromise; }
+  cartSyncPromise = (async () => {
+    do {
+      cartSyncRequested = false;
+      try {
+        if (!cartRemoteReady) {
+          const result = await window.JacohAPI.request("/api/customer/cart");
+          const remote = cleanCart(result.items);
+          const local = loadAccountCart(state.user.id);
+          const current = cleanCart(state.cart);
+          cartRemoteSnapshot = remote;
+          cartRemoteReady = true;
+          state.cart = rebaseAccountCart(remote, local);
+          state.cart = applyCartDelta(local.items, current, state.cart);
+          if (state.catalogReady) pruneCart();
+        }
+        const submitted = cleanCart(state.cart);
+        if (sameCart(submitted, cartRemoteSnapshot)) {
+          state.cartSyncStatus = "saved";
+          writeAccountCart(state.user.id, state.cart, cartRemoteSnapshot);
+          renderCart();
+        } else {
+          state.cartSyncStatus = "syncing";
+          renderCart();
+          const result = await window.JacohAPI.request("/api/customer/cart", { method: "PUT", body: JSON.stringify({ items: submitted }) });
+          const remote = cleanCart(result.items || submitted);
+          const current = cleanCart(state.cart);
+          cartRemoteSnapshot = remote;
+          state.cart = applyCartDelta(submitted, current, remote);
+          state.cartSyncStatus = sameCart(state.cart, remote) ? "saved" : "syncing";
+          writeAccountCart(state.user.id, state.cart, cartRemoteSnapshot);
+          renderCart();
+          if (!sameCart(state.cart, remote)) cartSyncRequested = true;
+        }
+      } catch {
+        cartRemoteReady = false;
+        state.cartSyncStatus = "offline";
+        writeAccountCart(state.user.id, state.cart, cartRemoteSnapshot);
+        renderCart();
+        scheduleCartRetry();
+        break;
+      }
+    } while (cartSyncRequested);
+  })().finally(() => {
+    cartSyncPromise = null;
+    if (cartSyncRequested) void syncAccountCart();
+  });
+  return cartSyncPromise;
+}
+
 
 function productById(id) {
   return products.find((product) => product.id === id);
@@ -320,6 +466,14 @@ function addToCart(id, scope = "card") {
     showToast("Your bag has reached the available stock for this piece");
     return false;
   }
+  if (existing && existing.quantity >= 10) {
+    showToast("You can add up to 10 of this size and color");
+    return false;
+  }
+  if (!existing && state.cart.length >= 30) {
+    showToast("Your bag is full. Remove a piece before adding another");
+    return false;
+  }
   if (existing) existing.quantity += 1;
   else state.cart.push({ id, size: selection.size, color: selection.color, quantity: 1 });
   persistCart();
@@ -343,7 +497,7 @@ function cartLineHTML(item, index) {
   return `<article class="cart-line">
     <img src="${escapeHTML(product.image)}" alt="" />
     <div class="cart-line-copy"><div class="cart-line-top"><div><h3>${escapeHTML(product.name)}</h3><p>${escapeHTML(item.color)} / ${escapeHTML(item.size)}</p></div><strong>${formatMoney(product.price * item.quantity)}</strong></div>
-      <div class="cart-line-bottom"><div class="quantity-control" aria-label="Quantity for ${escapeHTML(product.name)}"><button type="button" data-action="quantity" data-index="${index}" data-delta="-1" aria-label="Decrease quantity">−</button><span>${item.quantity}</span><button type="button" data-action="quantity" data-index="${index}" data-delta="1" aria-label="Increase quantity" ${item.quantity >= product.stock ? "disabled" : ""}>+</button></div><button class="remove-item" type="button" data-action="remove" data-index="${index}">REMOVE</button></div>
+      <div class="cart-line-bottom"><div class="quantity-control" aria-label="Quantity for ${escapeHTML(product.name)}"><button type="button" data-action="quantity" data-index="${index}" data-delta="-1" aria-label="Decrease quantity">−</button><span>${item.quantity}</span><button type="button" data-action="quantity" data-index="${index}" data-delta="1" aria-label="Increase quantity" ${item.quantity >= Math.min(product.stock, 10) ? "disabled" : ""}>+</button></div><button class="remove-item" type="button" data-action="remove" data-index="${index}">REMOVE</button></div>
     </div>
   </article>`;
 }
@@ -362,6 +516,10 @@ function renderCart() {
   const checkoutButton = document.getElementById("checkout-button");
   if (checkoutButton) checkoutButton.innerHTML = !state.sessionChecked || isCustomer() ? "GO TO CHECKOUT <span>↗</span>" : state.user ? "CUSTOMER ACCOUNT REQUIRED <span>↗</span>" : "SIGN IN TO CHECK OUT <span>↗</span>";
   document.getElementById("cart-delivery").textContent = sum >= FREE_DELIVERY ? "FREE" : "Calculated at checkout";
+  const fineprint = document.getElementById("cart-fineprint");
+  if (fineprint) fineprint.textContent = isCustomer()
+    ? (state.cartSyncStatus === "offline" ? "Your bag is saved on this device. Account sync will retry." : state.cartSyncStatus === "syncing" ? "Syncing your bag with your customer account…" : "Saved to your customer account and available across devices.")
+    : "Taxes and delivery details confirmed at checkout.";
   const remaining = Math.max(0, FREE_DELIVERY - sum);
   const progress = Math.min(100, (sum / FREE_DELIVERY) * 100);
   document.getElementById("shipping-progress").innerHTML = sum >= FREE_DELIVERY
@@ -427,13 +585,10 @@ if (window.location.pathname.replace(/\/+$/, "") === "") {
 state.sessionPromise = window.JacohAPI.request("/api/auth/me")
   .then(({ user }) => { state.user = user || null; })
   .catch(() => { state.user = null; })
-  .then(() => {
+  .then(async () => {
     state.sessionChecked = true;
-    if (isCustomer()) {
-      // Saved bag first, then anything added while the page was loading, then the sign-in hand-off.
-      state.cart = mergeCarts(mergeCarts(loadAccountCart(state.user.id), state.cart), handoffCart);
-      if (state.catalogReady) pruneCart(); else persistCart();
-    }
+    if (isCustomer()) await hydrateCustomerCart(handoffCart);
+    else cartHydrating = false;
     renderCart();
   });
 
@@ -605,6 +760,7 @@ document.addEventListener("click", (event) => {
       const product = productById(item.id);
       const delta = Number(target.dataset.delta);
       const productTotal = state.cart.filter((cartItem) => cartItem.id === item.id).reduce((sum, cartItem) => sum + cartItem.quantity, 0);
+      if (delta > 0 && item.quantity >= 10) { showToast("You can add up to 10 of this size and color"); return; }
       if (delta > 0 && product && productTotal >= product.stock) { showToast("That is all the available stock for this piece"); return; }
       item.quantity += delta;
       if (item.quantity < 1) state.cart.splice(Number(target.dataset.index), 1);

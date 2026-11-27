@@ -1,5 +1,6 @@
 const crypto = require("node:crypto");
 const bcrypt = require("bcryptjs");
+const nodemailer = require("nodemailer");
 const {
   json, fail, issueCsrf, validateCsrf, readJson, readBuffer, text, email, password, safeUser,
   currentUser, startSession, endSession, activity, requireUser, randomToken, digest, clearCookie, SESSION_COOKIE, expiryDate
@@ -24,6 +25,63 @@ const logisticsName = (id) => logisticsProviders.find((item) => item.id === id)?
 const AUTO_SUSPENSION_MONTHS = 3;
 const CUSTOMER_CANCELLABLE = ["to_pack", "processing", "ready_to_ship", "out_for_delivery"];
 const timingHash = bcrypt.hashSync(crypto.randomBytes(24).toString("hex"), 12);
+
+const passwordResetRequestMessage = "If a customer account exists for that email, password reset instructions are on the way.";
+const passwordResetUnavailableMessage = "Password reset is temporarily unavailable. Please try again later.";
+
+function customerCartItems(value) {
+  if (!Array.isArray(value) || value.length > 30) throw Object.assign(new Error("Your bag is empty or invalid."), { statusCode: 400 });
+  const items = new Map();
+  for (const item of value) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) throw Object.assign(new Error("Your bag is empty or invalid."), { statusCode: 400 });
+    const id = text(item.id, 64, "Product");
+    const size = text(item.size, 24, "Size");
+    const color = text(item.color, 64, "Color");
+    const quantity = Number(item.quantity);
+    if (!Number.isInteger(quantity) || quantity < 1 || quantity > 10) throw Object.assign(new Error("Each quantity must be between one and ten."), { statusCode: 400 });
+    const key = JSON.stringify([id, size, color]);
+    const existing = items.get(key);
+    if (existing) {
+      if (existing.quantity + quantity > 10) throw Object.assign(new Error("Each quantity must be between one and ten."), { statusCode: 400 });
+      existing.quantity += quantity;
+    } else {
+      items.set(key, { id, size, color, quantity });
+    }
+  }
+  return Array.from(items.values());
+}
+
+function htmlEscape(value) {
+  return String(value ?? "").replace(/[&<>"']/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[character]);
+}
+
+async function sendCustomerPasswordResetEmail(address, customerName, token) {
+  const gmailUser = String(process.env.GMAIL_USER || "").trim();
+  const appPassword = String(process.env.GMAIL_APP_PASSWORD || "").replace(/\s+/g, "");
+  if (!gmailUser || !appPassword) throw new Error("Gmail SMTP is not configured.");
+  const appUrl = new URL(process.env.APP_URL || "https://jacoh.vercel.app");
+  if (appUrl.protocol !== "https:" && appUrl.hostname !== "localhost") throw new Error("APP_URL must use HTTPS.");
+  const resetUrl = appUrl.origin + "/reset-password#token=" + encodeURIComponent(token);
+  const transporter = nodemailer.createTransport({
+    service: "gmail",
+    auth: { user: gmailUser, pass: appPassword },
+    connectionTimeout: 10000,
+    greetingTimeout: 10000,
+    socketTimeout: 10000
+  });
+  try {
+    await transporter.sendMail({
+      from: `"JACOH" <${gmailUser}>`,
+      to: address,
+      subject: "Reset your JACOH customer password",
+      html: "<p>Hi " + htmlEscape(customerName || "there") + ",</p><p>Use the secure link below to choose a new password for your JACOH customer account. The link expires in one hour and can only be used once.</p><p><a href=\"" + resetUrl + "\">RESET PASSWORD</a></p><p>If you did not request this, you can ignore this email.</p>",
+      text: "Use this secure link to reset your JACOH customer account password. It expires in one hour and can only be used once: " + resetUrl + "\n\nIf you did not request this, you can ignore this email."
+    });
+  } finally {
+    transporter.close();
+  }
+}
+
 
 function parsed(value) {
   if (Array.isArray(value)) return value;
@@ -396,6 +454,80 @@ async function dispatchApi(request, response, url, pool) {
   }
 
   if (method !== "GET" && !validateCsrf(request, response)) return true;
+
+  if (method === "POST" && route === "/api/auth/password-reset") {
+    const body = await readJson(request);
+    const address = email(body.email);
+    if (!String(process.env.GMAIL_USER || "").trim() || !String(process.env.GMAIL_APP_PASSWORD || "").replace(/\s/g, "")) return fail(response, 503, passwordResetUnavailableMessage, "email_unavailable");
+    let issuedReset = null;
+    const connection = await pool.getConnection();
+    try {
+      await connection.beginTransaction();
+      const [users] = await connection.execute("SELECT id,email,full_name FROM users WHERE email=? AND account_type='customer' AND active=1 FOR UPDATE", [address]);
+      const user = users[0];
+      if (!user) {
+        await connection.commit();
+        return json(response, 200, { ok: true, message: passwordResetRequestMessage });
+      }
+      const [recent] = await connection.execute("SELECT COUNT(*) requestCount FROM customer_password_resets WHERE user_id=? AND created_at>now()-interval '1 hour'", [user.id]);
+      if (Number(recent[0]?.requestCount || 0) >= 3) {
+        await connection.commit();
+        return json(response, 200, { ok: true, message: passwordResetRequestMessage });
+      }
+      await connection.execute("DELETE FROM customer_password_resets WHERE user_id=? AND created_at<now()-interval '1 day'", [user.id]);
+      await connection.execute("UPDATE customer_password_resets SET used_at=now() WHERE user_id=? AND used_at IS NULL", [user.id]);
+      const token = randomToken(32);
+      await connection.execute("INSERT INTO customer_password_resets (user_id,token_hash,expires_at) VALUES (?,?,?)", [user.id, digest(token), expiryDate(1 / 24)]);
+      issuedReset = { email: user.email, name: user.full_name, token };
+      await connection.commit();
+    } catch (error) {
+      await connection.rollback();
+      throw error;
+    } finally {
+      connection.release();
+    }
+    if (issuedReset) {
+      try {
+        await sendCustomerPasswordResetEmail(issuedReset.email, issuedReset.name, issuedReset.token);
+      } catch (error) {
+        await pool.execute("DELETE FROM customer_password_resets WHERE token_hash=? AND used_at IS NULL", [digest(issuedReset.token)]).catch(() => {});
+        console.error("Password reset email delivery failed", error.name || "email_error");
+      }
+    }
+    return json(response, 200, { ok: true, message: passwordResetRequestMessage });
+  }
+  if (method === "POST" && route === "/api/auth/password-reset/confirm") {
+    const body = await readJson(request);
+    const token = text(body.token, 128, "Reset link");
+    if (!/^[A-Za-z0-9_-]{40,64}$/.test(token)) return fail(response, 400, "This reset link is invalid or has expired. Request a new one to continue.", "invalid_reset_token");
+    const newPass = password(body.newPassword);
+    const connection = await pool.getConnection();
+    try {
+      await connection.beginTransaction();
+      const [rows] = await connection.execute(
+        "SELECT r.user_id userId FROM customer_password_resets r JOIN users u ON u.id=r.user_id WHERE r.token_hash=? AND r.expires_at>now() AND r.used_at IS NULL AND u.account_type='customer' AND u.active=1 FOR UPDATE OF r,u",
+        [digest(token)]
+      );
+      if (!rows.length) {
+        await connection.rollback();
+        return fail(response, 400, "This reset link is invalid or has expired. Request a new one to continue.", "invalid_reset_token");
+      }
+      const userId = rows[0].userId;
+      const hash = await bcrypt.hash(newPass, 12);
+      await connection.execute("UPDATE users SET password_hash=? WHERE id=?", [hash, userId]);
+      await connection.execute("DELETE FROM sessions WHERE user_id=?", [userId]);
+      await connection.execute("UPDATE customer_password_resets SET used_at=now() WHERE user_id=? AND used_at IS NULL", [userId]);
+      await activity(connection, userId, "account.password_reset", "Customer password reset by email");
+      await connection.commit();
+      clearCookie(response, request, SESSION_COOKIE, true);
+      return json(response, 200, { ok: true });
+    } catch (error) {
+      await connection.rollback();
+      throw error;
+    } finally {
+      connection.release();
+    }
+  }
   if (method === "POST" && route === "/api/auth/login") {
     const body = await readJson(request); const address = email(body.email); const pass = typeof body.password === "string" && Buffer.byteLength(body.password, "utf8") <= 72 ? body.password : "";
     const attemptKey = digest(address);
@@ -582,9 +714,23 @@ async function dispatchApi(request, response, url, pool) {
     return json(response, 200, { inquiries: rows });
   }
 
-  if (route.startsWith("/api/customer/") && ["GET", "PATCH", "POST"].includes(method) && route !== "/api/customer/inquiries") {
+  if (route.startsWith("/api/customer/") && ["GET", "PATCH", "POST", "PUT"].includes(method) && route !== "/api/customer/inquiries") {
     const customer = await currentUser(request, pool);
     if (!customer || customer.account_type !== "customer") return fail(response, 401, "Sign in with your customer account to continue.", "authentication_required");
+
+    if (method === "GET" && route === "/api/customer/cart") {
+      const [rows] = await pool.execute("SELECT items FROM customer_carts WHERE user_id=? LIMIT 1", [customer.id]);
+      return json(response, 200, { items: customerCartItems(Array.isArray(rows[0]?.items) ? rows[0].items : []) });
+    }
+    if (method === "PUT" && route === "/api/customer/cart") {
+      const body = await readJson(request);
+      const items = customerCartItems(body.items);
+      await pool.execute(
+        "INSERT INTO customer_carts (user_id,items) VALUES (?,?::jsonb) ON CONFLICT (user_id) DO UPDATE SET items=EXCLUDED.items,updated_at=now()",
+        [customer.id, JSON.stringify(items)]
+      );
+      return json(response, 200, { ok: true, items });
+    }
     if (method === "GET" && route === "/api/customer/profile") {
       const [rows] = await pool.execute("SELECT phone,address,city,postal_code postalCode FROM customers WHERE user_id=? LIMIT 1", [customer.id]);
       const detail = rows[0] || {};

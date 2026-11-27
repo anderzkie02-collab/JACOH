@@ -26,7 +26,7 @@ async function servePage(request, response, url) {
   try { pathname = decodeURIComponent(url.pathname); }
   catch { response.writeHead(400).end("Bad request"); return; }
   const pagePath = pathname.replace(/\/+$/, "") || "/";
-  if (request.method === "GET" && ["/seller", "/owner", "/sign-in", "/sign-up", "/customer-inquiries", "/account"].includes(pagePath)) {
+  if (request.method === "GET" && ["/seller", "/owner", "/sign-in", "/sign-up", "/forgot-password", "/reset-password", "/customer-inquiries", "/account"].includes(pagePath)) {
     const user = await currentUser(request, pool);
     if ((pagePath === "/seller" || pagePath === "/owner") && !user) {
       response.writeHead(302, { Location: "/sign-in", "Cache-Control": "no-store" }).end(); return;

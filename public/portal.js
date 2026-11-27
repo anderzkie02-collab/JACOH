@@ -1,6 +1,6 @@
 (() => {
   const root = document.getElementById("portal-root");
-  const titles = { "/sign-in": "Account access — JACOH Apparel", "/sign-up": "Create account — JACOH Apparel", "/seller": "Seller Portal — JACOH Apparel", "/owner": "Admin Portal — JACOH Apparel" };
+  const titles = { "/sign-in": "Account access — JACOH Apparel", "/sign-up": "Create account — JACOH Apparel", "/forgot-password": "Reset customer password — JACOH Apparel", "/reset-password": "Choose a new password — JACOH Apparel", "/seller": "Seller Portal — JACOH Apparel", "/owner": "Admin Portal — JACOH Apparel" };
   const api = window.JacohAPI;
   let dashboardData = null;
   let olapData = null;
@@ -309,11 +309,33 @@
           ${signUp ? `<label class="auth-field">FULL NAME<input name="name" autocomplete="name" maxlength="120" placeholder="Your name" required /></label>` : ""}
           <label class="auth-field">EMAIL ADDRESS<input name="email" type="email" autocomplete="email" maxlength="254" placeholder="you@example.com" required /></label>
           <label class="auth-field">PASSWORD<input name="password" type="password" autocomplete="${signUp ? "new-password" : "current-password"}" minlength="8" maxlength="128" placeholder="${signUp ? "At least 8 characters" : "Your password"}" required /></label>
-          ${signUp ? `<label class="auth-field">CONFIRM PASSWORD<input name="confirmPassword" type="password" autocomplete="new-password" minlength="8" maxlength="128" placeholder="Repeat your password" required /></label>` : `<label class="auth-remember"><input type="checkbox" name="remember" /> <span>Keep me signed in</span><span class="auth-help-note">Password reset? Contact your store owner.</span></label>`}
+          ${signUp ? `<label class="auth-field">CONFIRM PASSWORD<input name="confirmPassword" type="password" autocomplete="new-password" minlength="8" maxlength="128" placeholder="Repeat your password" required /></label>` : `<div class="auth-remember"><label><input type="checkbox" name="remember" /> <span>Keep me signed in</span></label><a href="/forgot-password">FORGOT PASSWORD?</a></div>`}
           <button class="auth-submit" type="submit">${signUp ? "CREATE CUSTOMER ACCOUNT" : "SIGN IN"} <span>↗</span></button>
         </form><div class="portal-message" id="portal-message" role="status" aria-live="polite"></div>
         <p class="auth-switch">${signUp ? "Already have an account?" : "New to JACOH?"} <a href="${accountSwitchPath}">${signUp ? "SIGN IN" : "CREATE AN ACCOUNT"}</a></p>
         <p class="auth-panel-foot">${signUp ? "CUSTOMER ACCOUNT · SELLER ACCESS IS INVITE-ONLY" : "YOUR ACCOUNT OPENS ITS OWN WORKSPACE AFTER SIGN-IN"}</p></div></section></main>`;
+  }
+
+
+  function passwordRecoveryPage(isReset) {
+    const token = isReset
+      ? (new URLSearchParams(location.hash.replace(/^#/, "")).get("token") || new URLSearchParams(location.search).get("token") || "")
+      : "";
+    const storyTitle = isReset ? "NEW<br><em>START.</em>" : "RESET<br><em>ACCESS.</em>";
+    const heading = isReset ? "SET A NEW PASSWORD" : "RESET CUSTOMER PASSWORD";
+    const intro = isReset
+      ? "Choose a new password for your JACOH customer account."
+      : "Enter the email address on your customer account. We will send a secure reset link if an account matches.";
+    const form = isReset
+      ? (token
+        ? '<form class="auth-form" data-password-reset-confirm><input type="hidden" name="token" value="' + esc(token) + '" /><label class="auth-field">NEW PASSWORD<input name="newPassword" type="password" autocomplete="new-password" minlength="8" maxlength="128" placeholder="At least 8 characters" required /></label><label class="auth-field">CONFIRM NEW PASSWORD<input name="confirmPassword" type="password" autocomplete="new-password" minlength="8" maxlength="128" placeholder="Repeat your password" required /></label><button class="auth-submit" type="submit">UPDATE PASSWORD <span>↗</span></button></form>'
+        : '<div class="auth-reset-note">This reset link is missing or incomplete. Request a new one to continue.</div>')
+      : '<form class="auth-form" data-password-reset-request><label class="auth-field">EMAIL ADDRESS<input name="email" type="email" autocomplete="email" maxlength="254" placeholder="you@example.com" required /></label><button class="auth-submit" type="submit">SEND RESET LINK <span>↗</span></button></form>';
+    const switchLink = isReset
+      ? '<p class="auth-switch">Need another link? <a href="/forgot-password">REQUEST A NEW ONE</a></p>'
+      : '<p class="auth-switch">Remember your password? <a href="/sign-in">SIGN IN</a></p>';
+    const foot = isReset ? "CUSTOMER ACCOUNT · LINK EXPIRES IN 1 HOUR" : "CUSTOMER ACCOUNT RECOVERY · EMAIL DELIVERY";
+    return '<main class="auth-layout"><section class="auth-story">' + logo() + '<div class="auth-story-copy"><div class="portal-kicker"><span></span> JACOH / ACCOUNT RECOVERY</div><h1>' + storyTitle + '</h1><p>Heavy layers. Muted tones. Your rotation, all in one place.</p><div class="auth-edition"><strong>06</strong><span>AFTER DARK<br />MEMBER ACCESS</span></div></div><div class="auth-story-footer"><span>BUILT FOR THE STREETS.</span><span>ALWAYS IN MOTION.</span></div></section><section class="auth-panel"><a class="auth-back" href="/">← BACK TO THE DROP</a><div class="auth-card"><div class="eyebrow">ACCOUNT / RECOVERY</div><h2>' + heading + '</h2><p class="auth-intro">' + intro + '</p>' + form + '<div class="portal-message" id="portal-message" role="status" aria-live="polite"></div>' + switchLink + '<p class="auth-panel-foot">' + foot + '</p></div></section></main>';
   }
 
   function icon(mark) { return `<span class="workspace-icon" aria-hidden="true">${mark}</span>`; }
@@ -429,6 +451,11 @@
         else if (session.user.accountType === "seller") window.location.replace("/seller");
         else window.location.replace("/");
       } catch (error) { if (error.status !== 401) notify(error.message); }
+      if (pathname === "/sign-in" && new URLSearchParams(location.search).get("reset") === "complete") notify("Password updated. Sign in with your new password.");
+      return;
+    }
+    if (pathname === "/forgot-password" || pathname === "/reset-password") {
+      root.innerHTML = passwordRecoveryPage(pathname === "/reset-password");
       return;
     }
     root.innerHTML = `<main class="auth-layout"><section class="auth-panel"><div class="auth-card"><h2>LOADING WORKSPACE</h2><p>Checking your account…</p></div></section></main>`;
@@ -447,6 +474,31 @@
   }
 
   root.addEventListener("submit", async (event) => {
+    const requestReset = event.target.closest("[data-password-reset-request]");
+    if (requestReset) {
+      event.preventDefault(); if (!requestReset.reportValidity()) return;
+      const submit = requestReset.querySelector("[type=submit]"); submit.disabled = true;
+      try {
+        const result = await api.request("/api/auth/password-reset", { method: "POST", body: JSON.stringify({ email: requestReset.elements.email.value }) });
+        notify(result.message || "If a customer account exists for that email, reset instructions are on the way.");
+        requestReset.reset();
+      } catch (error) { notify(error.message); }
+      finally { submit.disabled = false; }
+      return;
+    }
+    const confirmReset = event.target.closest("[data-password-reset-confirm]");
+    if (confirmReset) {
+      event.preventDefault(); if (!confirmReset.reportValidity()) return;
+      if (confirmReset.elements.newPassword.value !== confirmReset.elements.confirmPassword.value) {
+        notify("Those passwords do not match."); confirmReset.elements.confirmPassword.focus(); return;
+      }
+      const submit = confirmReset.querySelector("[type=submit]"); submit.disabled = true;
+      try {
+        await api.request("/api/auth/password-reset/confirm", { method: "POST", body: JSON.stringify({ token: confirmReset.elements.token.value, newPassword: confirmReset.elements.newPassword.value }) });
+        window.location.assign("/sign-in?reset=complete");
+      } catch (error) { notify(error.message); submit.disabled = false; }
+      return;
+    }
     const form = event.target.closest("[data-auth-form]");
     if (!form) return;
     event.preventDefault(); if (!form.reportValidity()) return;
